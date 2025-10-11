@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
+import os
+import time
 import requests
 import gspread
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from oauth2client.service_account import ServiceAccountCredentials
 from pprint import pprint
 
 # -----------------------------
-# CONFIG
+# CONFIG (env-overridable)
 # -----------------------------
-SPREADSHEET_ID = "YOUR_SPREADSHEET_ID"  # Replace with your sheet ID
-GOOGLE_CREDS_JSON = "path/to/credentials.json"  # Service account JSON
-EXPIRY_DATE = "2025-10-28"
+# Repo workflow sets: SHEET_ID and GOOGLE_CREDENTIALS_PATH
+SPREADSHEET_ID = os.environ.get("SHEET_ID", "YOUR_SPREADSHEET_ID")
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_PATH", "path/to/credentials.json")
+EXPIRY_DATE = os.environ.get("EXPIRY_DATE", "2025-10-28")
+
+# Networking controls
+REQUEST_TIMEOUT_S = float(os.environ.get("REQUEST_TIMEOUT_S", "15"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+BACKOFF_FACTOR = float(os.environ.get("BACKOFF_FACTOR", "0.5"))
+REQUEST_DELAY_S = float(os.environ.get("REQUEST_DELAY_S", "0"))  # pacing between symbols
 
 NIFTY50 = [
     "reliance", "tcs", "infy", "hdfcbank", "icicibank", "sbilife", "axisbank",
@@ -28,15 +39,38 @@ HEADERS = [
     'Diff Amount (Q)', 'OI Diff (R)', 'R * Call VWAP (S)', 'R * Put VWAP (T)'
 ]
 
-# -----------------------------
-# GOOGLE SHEETS AUTH
-# -----------------------------
-scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/spreadsheets",
-         "https://www.googleapis.com/auth/drive.file","https://www.googleapis.com/auth/drive"]
+def _build_session(max_retries: int, backoff_factor: float) -> requests.Session:
+    retry = Retry(
+        total=max_retries,
+        read=max_retries,
+        connect=max_retries,
+        status=max_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "POST"),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
-creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDS_JSON, scope)
-client = gspread.authorize(creds)
-sheet = client.open_by_key(SPREADSHEET_ID)
+
+def _authorize_sheets(spreadsheet_id: str, creds_json_path: str) -> gspread.Spreadsheet:
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(creds_json_path, scope)
+    client = gspread.authorize(creds)
+    return client.open_by_key(spreadsheet_id)
+
+
+session = _build_session(MAX_RETRIES, BACKOFF_FACTOR)
+sheet = _authorize_sheets(SPREADSHEET_ID, GOOGLE_CREDS_JSON)
 
 # -----------------------------
 # FUNCTION
@@ -47,10 +81,15 @@ def fetch_option_chain(symbol, index):
         "Accept": "application/json",
         "Referer": "https://www.niftytrader.in/",
         "Origin": "https://www.niftytrader.in",
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     }
     
-    resp = requests.get(url, headers=headers)
+    try:
+        resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT_S)
+    except requests.RequestException as exc:
+        print(f"⚠️ Network error for {symbol}: {exc}")
+        return
+
     if resp.status_code != 200:
         print(f"⚠️ HTTP {resp.status_code} for {symbol}")
         return
@@ -138,14 +177,29 @@ def fetch_option_chain(symbol, index):
     
     # Update post-calculation columns (L to T)
     if calculated_data:
-        ws.update(f"L2", calculated_data)
+        ws.update("L2", calculated_data)
     
     print(f"✅ {sheet_name} updated. CallDiffSum={call_diff_sum}, PutDiffSum={put_diff_sum}")
 
-# -----------------------------
-# MAIN LOOP
-# -----------------------------
-for idx, sym in enumerate(NIFTY50):
-    fetch_option_chain(sym, idx)
+def _load_symbols(default_symbols: list[str]) -> list[str]:
+    csv = os.environ.get("SYMBOLS", "").strip()
+    if not csv:
+        return default_symbols
+    parsed = [s.strip().lower() for s in csv.split(",") if s.strip()]
+    return parsed if parsed else default_symbols
 
-print("🏁 All NIFTY50 updates completed.")
+
+if __name__ == "__main__":
+    if SPREADSHEET_ID == "YOUR_SPREADSHEET_ID":
+        print("❌ SHEET_ID environment variable not set. Aborting.")
+        raise SystemExit(1)
+
+    symbols = _load_symbols(NIFTY50)
+    print(f"▶️ Updating {len(symbols)} symbols | expiry={EXPIRY_DATE} | delay={REQUEST_DELAY_S}s")
+
+    for idx, sym in enumerate(symbols):
+        fetch_option_chain(sym, idx)
+        if REQUEST_DELAY_S > 0 and idx < len(symbols) - 1:
+            time.sleep(REQUEST_DELAY_S)
+
+    print("🏁 All NIFTY50 updates completed.")
