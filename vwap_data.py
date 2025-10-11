@@ -1,110 +1,151 @@
-# vwap_data.py
+#!/usr/bin/env python3
 import requests
-import pandas as pd
 import gspread
-from gspread_dataframe import set_with_dataframe
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
-import os
-import time
-#
+from pprint import pprint
 
-# -------------------- CONFIG --------------------
-SERVICE_ACCOUNT_FILE = "service_account.json"   # service account JSON file (added via GitHub Actions)
-SHEET_ID = os.environ.get("SHEET_ID")           # GitHub Secret for Google Sheet ID
-UPDATE_INTERVAL = 60                            # seconds refresh interval
+# -----------------------------
+# CONFIG
+# -----------------------------
+SPREADSHEET_ID = "YOUR_SPREADSHEET_ID"  # Replace with your sheet ID
+GOOGLE_CREDS_JSON = "path/to/credentials.json"  # Service account JSON
+EXPIRY_DATE = "2025-10-28"
 
-# -------------------- NIFTY50 SYMBOLS --------------------
-nifty50_map = {
-    "HDFC Life": "HSL01",
-    "Cipla": "C",
-    "Britannia": "BI",
-    "Shriram Finance": "STF",
-    "BPCL": "BPC",
-    "Tata Consumer": "TT",
-    "Dr Reddys": "DRL",
-    "Apollo Hospital": "AHE",
-    "IndusInd Bank": "IIB",
-    "Hero Motocorp": "HHM"
-    }
+NIFTY50 = [
+    "reliance", "tcs", "infy", "hdfcbank", "icicibank", "sbilife", "axisbank",
+    "lt", "itc", "sbin", "bhartiartl", "kotakbank", "hcltech", "ongc", "ntpc",
+    "techm", "asianpaint", "maruti", "titan", "sunpharma", "hindunilvr", "ultracemco",
+    "powergrid", "nestleind", "cipla", "tatamotors", "tatasteel", "coalindia", "drreddy",
+    "jswsteel", "grasim", "indusindbk", "bajajfinserv", "bajajfinsv", "hdfclife", "tataconsumer",
+    "apollohosp", "britannia", "adaniports", "bpcl", "divislab", "heromotoco", "eichermot",
+    "upl", "tvs", "hindalco", "shriramfinance", "suntv", "zomato"
+]
 
-# -------------------- API ENDPOINTS --------------------
-ltp_url = "https://api.moneycontrol.com/mcapi/v1/stock/get-stock-price"
-vwap_url_template = "https://priceapi.moneycontrol.com/pricefeed/nse/equitycash/{}"
+HEADERS = [
+    'Strike', 'Call OI', 'Call LTP', 'Call IV', 'Call VWAP', 'Call LTP - VWAP',
+    'Put OI', 'Put LTP', 'Put IV', 'Put VWAP', 'Put LTP - VWAP',
+    'Call Intrinsic', 'Put Intrinsic', 'Abs Diff (Call-Put)', 'Call + Put Diff', 'Spot',
+    'Diff Amount (Q)', 'OI Diff (R)', 'R * Call VWAP (S)', 'R * Put VWAP (T)'
+]
 
-headers = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json, text/plain, */*",
-    "Referer": "https://www.moneycontrol.com",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+# -----------------------------
+# GOOGLE SHEETS AUTH
+# -----------------------------
+scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/spreadsheets",
+         "https://www.googleapis.com/auth/drive.file","https://www.googleapis.com/auth/drive"]
 
-# -------------------- GOOGLE SHEETS AUTH --------------------
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, scope)
+creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDS_JSON, scope)
 client = gspread.authorize(creds)
-# sheet = client.open_by_key(SHEET_ID).sheet1
-sheet = client.open("NSE data").worksheet("Nifty50VWAP")
+sheet = client.open_by_key(SPREADSHEET_ID)
 
-# Write headers if sheet is empty
-if len(sheet.get_all_values()) == 0:
-    headers_row = ["Timestamp", "Company", "Symbol Code", "LTP", "% Change", "VWAP/AVGP"]
-    sheet.append_row(headers_row)
+# -----------------------------
+# FUNCTION
+# -----------------------------
+def fetch_option_chain(symbol, index):
+    url = f"https://webapi.niftytrader.in/webapi/option/option-chain-data?symbol={symbol}&exchange=nse&expiryDate={EXPIRY_DATE}&atmBelow=0&atmAbove=0"
+    headers = {
+        "Accept": "application/json",
+        "Referer": "https://www.niftytrader.in/",
+        "Origin": "https://www.niftytrader.in",
+        "User-Agent": "Mozilla/5.0"
+    }
+    
+    resp = requests.get(url, headers=headers)
+    if resp.status_code != 200:
+        print(f"⚠️ HTTP {resp.status_code} for {symbol}")
+        return
+    
+    data_json = resp.json()
+    data = data_json.get("resultData", {}).get("opDatas", [])
+    if not data:
+        print(f"⚠️ No valid data for {symbol}")
+        return
+    
+    # Sheet name
+    sheet_name = f"Option_{symbol.upper()}"
+    try:
+        ws = sheet.worksheet(sheet_name)
+        ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=sheet_name, rows=100, cols=20)
+    
+    # Prepare rows
+    output = [HEADERS]
+    call_diff_sum = 0
+    put_diff_sum = 0
+    
+    for item in data:
+        callLTP = float(item.get("calls_ltp") or 0)
+        callVWAP = float(item.get("calls_average_price") or 0)
+        putLTP = float(item.get("puts_ltp") or 0)
+        putVWAP = float(item.get("puts_average_price") or 0)
+        
+        callDiff = callLTP - callVWAP
+        putDiff = putLTP - putVWAP
+        call_diff_sum += callDiff
+        put_diff_sum += putDiff
+        
+        row = [
+            item.get("strike_price") or 0,
+            item.get("calls_oi") or 0,
+            callLTP,
+            item.get("calls_iv") or 0,
+            callVWAP,
+            callDiff,
+            item.get("puts_oi") or 0,
+            putLTP,
+            item.get("puts_iv") or 0,
+            putVWAP,
+            putDiff,
+            '', '', '', '', '', '', '', '', ''
+        ]
+        output.append(row)
+    
+    ws.update("A1", output)
+    
+    # Spot price
+    spot_sheet_name = f"{index+1}.{symbol.upper()}"
+    try:
+        spot_ws = sheet.worksheet(spot_sheet_name)
+        spot = float(spot_ws.acell("A1").value or 0)
+    except gspread.WorksheetNotFound:
+        spot = 0
+        print(f"⚠️ Spot sheet '{spot_sheet_name}' not found.")
+    
+    # Post-calculation
+    calculated_data = []
+    for r in output[1:]:
+        strike = float(r[0])
+        callOI = float(r[1])
+        callLTP = float(r[2])
+        callVWAP = float(r[4])
+        callDiff = float(r[5])
+        putOI = float(r[6])
+        putLTP = float(r[7])
+        putVWAP = float(r[9])
+        putDiff = float(r[10])
+        
+        callIntrinsic = max(spot - strike, 0)
+        putIntrinsic = max(strike - spot, 0)
+        absDiff = abs(callDiff - putDiff)
+        sumDiff = callDiff + putDiff
+        q = ((callOI * callLTP) - (putOI * putLTP)) / 10000000
+        r_val = (callOI - putOI) / 1000000
+        s = r_val * (-callVWAP)
+        t = r_val * putVWAP
+        
+        calculated_data.append([callIntrinsic, putIntrinsic, absDiff, sumDiff, spot, q, r_val, s, t])
+    
+    # Update post-calculation columns (L to T)
+    if calculated_data:
+        ws.update(f"L2", calculated_data)
+    
+    print(f"✅ {sheet_name} updated. CallDiffSum={call_diff_sum}, PutDiffSum={put_diff_sum}")
 
-# -------------------- MAIN LOOP --------------------
-while True:
-    results = []
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# -----------------------------
+# MAIN LOOP
+# -----------------------------
+for idx, sym in enumerate(NIFTY50):
+    fetch_option_chain(sym, idx)
 
-    for name, scId in nifty50_map.items():
-        try:
-            # LTP data
-            params = {"scIdList": scId, "scId": scId}
-            ltp_resp = requests.get(ltp_url, params=params, headers=headers, timeout=10).json()
-
-            if "data" not in ltp_resp or not ltp_resp["data"]:
-                print(f"[{timestamp}] ⚠️ No LTP for {name}")
-                continue
-
-            ltp_data = ltp_resp["data"][0]
-            ltp = ltp_data.get("lastPrice", "-")
-            change = ltp_data.get("perChange", "-")
-
-            # VWAP data
-            vwap = None
-            try:
-                vwap_resp = requests.get(vwap_url_template.format(scId), headers=headers, timeout=10).json()
-                if vwap_resp.get("data"):
-                    vwap = vwap_resp["data"].get("VWAP") or vwap_resp["data"].get("AVGP")
-            except Exception as e:
-                print(f"[{timestamp}] VWAP error {name}: {e}")
-
-            results.append({
-                "Timestamp": timestamp,
-                "Company": name,
-                "Symbol Code": scId,
-                "LTP": ltp,
-                "% Change": change,
-                "VWAP/AVGP": vwap
-            })
-
-        except Exception as e:
-            print(f"[{timestamp}] ❌ Error fetching {name}: {e}")
-
-        time.sleep(0.5)  # avoid rate limiting
-
-    # Convert to DataFrame
-    df = pd.DataFrame(results)
-    print(df.head())
-
-# Overwrite old data (starting row=2, below headers)
-    set_with_dataframe(
-    sheet,
-    df,
-    row=2,                     # always start at row 2
-    include_index=False,
-    include_column_header=False
-)
-
-    print(f"[{timestamp}] ✅ Data refreshed in Google Sheet (overwritten old data)")
-    time.sleep(UPDATE_INTERVAL)
+print("🏁 All NIFTY50 updates completed.")
