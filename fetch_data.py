@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -----------------------------------
 # SENSEX Option Chain Updater
 # (KiteConnect + Google Sheets)
