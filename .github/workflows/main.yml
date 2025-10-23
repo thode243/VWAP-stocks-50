@@ -2,14 +2,15 @@ name: Sensex Option Chain Updater
 
 on:
   schedule:
-    - cron: "5 9-15 * * 1-5"  # every hour between 9:05 AM–3:59 PM IST (Mon–Fri)
+    - cron: "5 3-10 * * 1-5"  # Every hour 8:35–15:35 IST (adjusted to UTC)
   workflow_dispatch:
 
 jobs:
   update-sensex:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
