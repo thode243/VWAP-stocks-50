@@ -31,7 +31,7 @@ EXPIRIES = [
 ist = pytz.timezone("Asia/Kolkata")
 now = datetime.now(ist)
 current_time = now.time()
-market_open = time(9, 10)
+market_open = time(8, 40)
 market_close = time(15, 30)
 
 if not (market_open <= current_time <= market_close) or now.weekday() >= 5:
